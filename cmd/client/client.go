@@ -76,5 +76,8 @@ func main() {
 	if err != nil {
 		log.Fatalf(err.Error())
 	}
-	fmt.Println(reply.Value)
+
+	if reply.Value {
+		fmt.Printf("file %s successfully uploaded to server", fileName)
+	}
 }

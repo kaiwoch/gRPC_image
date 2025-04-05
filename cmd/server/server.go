@@ -22,24 +22,17 @@ import (
 
 type server struct {
 	pb.UnimplementedUserAPIServer
-	storage   map[string]Information
+	storage   []*pb.Info
 	uploadDir string
 }
 
-type Information struct {
-	FileName  string                 `json:"name"`
-	CreatedAt *timestamppb.Timestamp `json:"created_at"`
-	UpdatedAt *timestamppb.Timestamp `json:"updated_at"`
-}
-
 func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
+	s.uploadDir = "storage"
 	var (
 		file       *os.File
+		info       *pb.Info
 		filename   string
-		createdAt  *timestamppb.Timestamp
-		updatedAt  *timestamppb.Timestamp
 		firstChunk = true
-		info       Information
 	)
 
 	if _, err := os.Stat("storage.json"); errors.Is(err, os.ErrNotExist) {
@@ -51,17 +44,16 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 		return err
 	}
 
-	if s.storage == nil {
-		s.storage = make(map[string]Information)
-	}
-
 	err = json.Unmarshal(b, &s.storage)
+	if err != nil {
+		return err
+	}
 
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
 
-			s.storage[info.FileName] = info
+			s.storage = append(s.storage, info)
 
 			data, err := json.Marshal(s.storage)
 			if err != nil {
@@ -84,18 +76,10 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 			if chunk.GetFileName() == "" {
 				return status.Errorf(codes.Internal, "first chunk must contain metadata")
 			}
+
 			filename = chunk.GetFileName()
-			if v, ok := s.storage[filename]; !ok {
-				createdAt = timestamppb.Now()
-				updatedAt = timestamppb.Now()
-			} else {
-				createdAt = v.CreatedAt
-				updatedAt = timestamppb.Now()
-			}
-			s.uploadDir = "storage"
-			info.FileName = filename
-			info.CreatedAt = createdAt
-			info.UpdatedAt = updatedAt
+
+			info = FindName(filename, &s.storage)
 
 			filePath := filepath.Join(s.uploadDir, filename)
 
@@ -120,11 +104,39 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 }
 
 func (s *server) GetInfo(ctx context.Context, st *emptypb.Empty) (*pb.FileList, error) {
-	return &pb.FileList{}, nil
+	if _, err := os.Stat("storage.json"); errors.Is(err, os.ErrNotExist) {
+		os.Create("storage.json")
+	}
+
+	b, err := os.ReadFile("storage.json")
+	if err != nil {
+		return &pb.FileList{}, nil
+	}
+
+	err = json.Unmarshal(b, &s.storage)
+	if err != nil {
+		return &pb.FileList{}, nil
+	}
+	return &pb.FileList{Files: s.storage}, nil
 }
 
 func (s *server) Download(name *pb.DownloadRequest, stream pb.UserAPI_DownloadServer) error {
 	return nil
+}
+
+func FindName(filename string, storage *[]*pb.Info) *pb.Info {
+	createdAt := timestamppb.Now()
+	updatedAt := timestamppb.Now()
+
+	for i, v := range *storage {
+		if v.GetFileName() == filename {
+			createdAt = v.CreatedAt
+			updatedAt = timestamppb.Now()
+			*storage = append((*storage)[:i], (*storage)[i+1:]...)
+			return &pb.Info{FileName: filename, CreatedAt: createdAt, UpdatedAt: updatedAt}
+		}
+	}
+	return &pb.Info{FileName: filename, CreatedAt: createdAt, UpdatedAt: updatedAt}
 }
 
 const (
