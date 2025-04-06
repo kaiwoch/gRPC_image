@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/KamigamiNoGigan/grpc/pkg/server_api_v1"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const (
@@ -21,7 +22,7 @@ const (
 
 func main() {
 	wg := &sync.WaitGroup{}
-	if len(os.Args) < 3 {
+	if len(os.Args) < 2 {
 		log.Fatal("wrong os.Args")
 	}
 
@@ -52,10 +53,28 @@ func main() {
 				ClientDownload(c, file)
 			}(file)
 		}
+	case "info":
+		ClientGetInfo(c)
 	}
 
 	wg.Wait()
 
+}
+
+func ClientGetInfo(c pb.UserAPIClient) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	defer cancel()
+
+	info, err := c.GetInfo(ctx, &emptypb.Empty{})
+	if err != nil {
+		log.Println(err.Error())
+		return
+	}
+
+	fmt.Println("Имя файла | Дата создания | Дата обновления")
+	for _, v := range info.Files {
+		fmt.Println(v.FileName, "|", v.CreatedAt.AsTime().Format(time.RFC1123), "|", v.UpdatedAt.AsTime().Format(time.RFC1123))
+	}
 }
 
 func ClientUpload(c pb.UserAPIClient, path string) {
