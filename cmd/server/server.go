@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 
 	pb "github.com/KamigamiNoGigan/grpc/pkg/server_api_v1"
 	"google.golang.org/grpc"
@@ -24,9 +25,43 @@ type server struct {
 	pb.UnimplementedUserAPIServer
 	storage   []*pb.Info
 	uploadDir string
+
+	uploadSem   chan struct{}
+	downloadSem chan struct{}
+	infoSem     chan struct{}
+
+	storageMu sync.Mutex
+}
+
+func NewServer() *server {
+	s := &server{
+		uploadSem:   make(chan struct{}, 10),
+		downloadSem: make(chan struct{}, 10),
+		infoSem:     make(chan struct{}, 100),
+		uploadDir:   "storage",
+	}
+
+	if _, err := os.Stat("storage.json"); errors.Is(err, os.ErrNotExist) {
+		os.Create("storage.json")
+	}
+
+	b, _ := os.ReadFile("storage.json")
+
+	err := json.Unmarshal(b, &s.storage)
+
+	if err != nil {
+		log.Fatalf("failed to unmarshal storage.json: %v", err)
+	}
+
+	return s
 }
 
 func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
+	s.uploadSem <- struct{}{}
+	defer func() {
+		<-s.uploadSem
+	}()
+
 	s.uploadDir = "storage"
 	var (
 		file       *os.File
@@ -35,20 +70,6 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 		firstChunk = true
 	)
 
-	if _, err := os.Stat("storage.json"); errors.Is(err, os.ErrNotExist) {
-		os.Create("storage.json")
-	}
-
-	b, err := os.ReadFile("storage.json")
-	if err != nil {
-		return err
-	}
-
-	err = json.Unmarshal(b, &s.storage)
-	if err != nil {
-		return err
-	}
-
 	select {
 	case <-stream.Context().Done():
 		return stream.Context().Err()
@@ -56,15 +77,20 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 		for {
 			chunk, err := stream.Recv()
 			if err == io.EOF {
-
+				s.storageMu.Lock()
 				s.storage = append(s.storage, info)
 
 				data, err := json.Marshal(s.storage)
 				if err != nil {
 					return err
 				}
-				os.WriteFile("storage.json", data, 0777)
-
+				err = os.WriteFile("storage.json", data, 0777)
+				if err != nil {
+					log.Printf("write file error: %v", err)
+					s.storageMu.Unlock()
+					return err
+				}
+				s.storageMu.Unlock()
 				return stream.SendAndClose(&wrapperspb.BoolValue{Value: true})
 			}
 			if err != nil {
@@ -82,9 +108,9 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 				}
 
 				filename = chunk.GetFileName()
-
+				s.storageMu.Lock()
 				info = FindName(filename, &s.storage)
-
+				s.storageMu.Unlock()
 				filePath := filepath.Join(s.uploadDir, filename)
 
 				file, err = os.Create(filePath)
@@ -110,38 +136,23 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 }
 
 func (s *server) GetInfo(ctx context.Context, st *emptypb.Empty) (*pb.FileList, error) {
-	if _, err := os.Stat("storage.json"); errors.Is(err, os.ErrNotExist) {
-		os.Create("storage.json")
-	}
+	s.infoSem <- struct{}{}
+	defer func() {
+		<-s.infoSem
+	}()
 
-	b, err := os.ReadFile("storage.json")
-	if err != nil {
-		return &pb.FileList{}, nil
-	}
-
-	err = json.Unmarshal(b, &s.storage)
-	if err != nil {
-		return &pb.FileList{}, nil
-	}
 	return &pb.FileList{Files: s.storage}, nil
 }
 
 func (s *server) Download(name *pb.DownloadRequest, stream pb.UserAPI_DownloadServer) error {
+	s.downloadSem <- struct{}{}
+	defer func() {
+		<-s.downloadSem
+	}()
 	var find bool = false
-	if _, err := os.Stat("storage.json"); errors.Is(err, os.ErrNotExist) {
-		os.Create("storage.json")
-	}
-
-	b, err := os.ReadFile("storage.json")
-	if err != nil {
-		return err
-	}
-
-	err = json.Unmarshal(b, &s.storage)
 
 	s.uploadDir = "storage"
 	for _, v := range s.storage {
-		log.Println(v.FileName)
 		if v.FileName == name.FileName {
 			find = true
 			filePath := filepath.Join(s.uploadDir, v.FileName)
@@ -182,7 +193,6 @@ func (s *server) Download(name *pb.DownloadRequest, stream pb.UserAPI_DownloadSe
 func FindName(filename string, storage *[]*pb.Info) *pb.Info {
 	createdAt := timestamppb.Now()
 	updatedAt := timestamppb.Now()
-
 	for i, v := range *storage {
 		if v.GetFileName() == filename {
 			createdAt = v.CreatedAt
@@ -203,9 +213,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
-	s := grpc.NewServer()
+	s := grpc.NewServer(grpc.MaxConcurrentStreams(100))
 	reflection.Register(s)
-	pb.RegisterUserAPIServer(s, &server{})
+	pb.RegisterUserAPIServer(s, NewServer())
 
 	log.Println("Starting gRPC listener on port " + port)
 	if err := s.Serve(lis); err != nil {

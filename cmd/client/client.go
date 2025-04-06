@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/KamigamiNoGigan/grpc/pkg/server_api_v1"
@@ -19,11 +20,12 @@ const (
 )
 
 func main() {
+	wg := &sync.WaitGroup{}
 	if len(os.Args) < 3 {
 		log.Fatal("wrong os.Args")
 	}
 
-	path := os.Args[2:]
+	files := os.Args[2:]
 
 	conn, err := grpc.Dial(address, grpc.WithInsecure())
 	if err != nil {
@@ -33,17 +35,26 @@ func main() {
 
 	c := pb.NewUserAPIClient(conn)
 
-	if strings.ToLower(os.Args[1]) == "upload" {
-		for _, file := range path {
-			ClientUpload(c, file)
+	switch strings.ToLower(os.Args[1]) {
+	case "upload":
+		for _, file := range files {
+			wg.Add(1)
+			go func(file string) {
+				defer wg.Done()
+				ClientUpload(c, file)
+			}(file)
+		}
+	case "download":
+		for _, file := range files {
+			wg.Add(1)
+			go func(file string) {
+				defer wg.Done()
+				ClientDownload(c, file)
+			}(file)
 		}
 	}
 
-	if strings.ToLower(os.Args[1]) == "download" {
-		for _, fileName := range path {
-			ClientDownload(c, fileName)
-		}
-	}
+	wg.Wait()
 
 }
 
