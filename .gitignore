@@ -1,1 +1,3 @@
 /bin/
+/cmd/server/storage
+/cmd/client/download

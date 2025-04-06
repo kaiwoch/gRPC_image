@@ -49,58 +49,64 @@ func (s *server) Upload(stream pb.UserAPI_UploadServer) error {
 		return err
 	}
 
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
+	select {
+	case <-stream.Context().Done():
+		return stream.Context().Err()
+	default:
+		for {
+			chunk, err := stream.Recv()
+			if err == io.EOF {
 
-			s.storage = append(s.storage, info)
+				s.storage = append(s.storage, info)
 
-			data, err := json.Marshal(s.storage)
-			if err != nil {
-				return err
+				data, err := json.Marshal(s.storage)
+				if err != nil {
+					return err
+				}
+				os.WriteFile("storage.json", data, 0777)
+
+				return stream.SendAndClose(&wrapperspb.BoolValue{Value: true})
 			}
-			os.WriteFile("storage.json", data, 0777)
+			if err != nil {
+				if file != nil {
+					file.Close()
+					os.Remove(file.Name())
+				}
+				return status.Errorf(codes.Internal, "failed to receive chuck: %v", err)
+			}
 
-			return stream.SendAndClose(&wrapperspb.BoolValue{Value: true})
-		}
-		if err != nil {
-			if file != nil {
+			if firstChunk {
+				firstChunk = false
+				if chunk.GetFileName() == "" {
+					return status.Errorf(codes.Internal, "first chunk must contain metadata")
+				}
+
+				filename = chunk.GetFileName()
+
+				info = FindName(filename, &s.storage)
+
+				filePath := filepath.Join(s.uploadDir, filename)
+
+				file, err = os.Create(filePath)
+				if err != nil {
+					return status.Errorf(codes.Internal, "failed to create file: %v", err)
+				}
+				continue
+			}
+
+			if chunk.GetChunkData() == nil {
+				return status.Error(codes.InvalidArgument, "non-first chunk must contain data")
+			}
+
+			if _, err := file.Write(chunk.GetChunkData()); err != nil {
 				file.Close()
 				os.Remove(file.Name())
-			}
-			return status.Errorf(codes.Internal, "failed to receive chuck: %v", err)
-		}
-
-		if firstChunk {
-			firstChunk = false
-			if chunk.GetFileName() == "" {
-				return status.Errorf(codes.Internal, "first chunk must contain metadata")
+				return status.Errorf(codes.Internal, "failed to write chunk: %v", err)
 			}
 
-			filename = chunk.GetFileName()
-
-			info = FindName(filename, &s.storage)
-
-			filePath := filepath.Join(s.uploadDir, filename)
-
-			file, err = os.Create(filePath)
-			if err != nil {
-				return status.Errorf(codes.Internal, "failed to create file: %v", err)
-			}
-			continue
 		}
-
-		if chunk.GetChunkData() == nil {
-			return status.Error(codes.InvalidArgument, "non-first chunk must contain data")
-		}
-
-		if _, err := file.Write(chunk.GetChunkData()); err != nil {
-			file.Close()
-			os.Remove(file.Name())
-			return status.Errorf(codes.Internal, "failed to write chunk: %v", err)
-		}
-
 	}
+
 }
 
 func (s *server) GetInfo(ctx context.Context, st *emptypb.Empty) (*pb.FileList, error) {
@@ -121,6 +127,55 @@ func (s *server) GetInfo(ctx context.Context, st *emptypb.Empty) (*pb.FileList, 
 }
 
 func (s *server) Download(name *pb.DownloadRequest, stream pb.UserAPI_DownloadServer) error {
+	var find bool = false
+	if _, err := os.Stat("storage.json"); errors.Is(err, os.ErrNotExist) {
+		os.Create("storage.json")
+	}
+
+	b, err := os.ReadFile("storage.json")
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(b, &s.storage)
+
+	s.uploadDir = "storage"
+	for _, v := range s.storage {
+		log.Println(v.FileName)
+		if v.FileName == name.FileName {
+			find = true
+			filePath := filepath.Join(s.uploadDir, v.FileName)
+			file, err := os.Open(filePath)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			buf := make([]byte, 64*1024)
+			for {
+				select {
+				case <-stream.Context().Done():
+					return stream.Context().Err()
+				default:
+					n, err := file.Read(buf)
+					if err == io.EOF {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					if err := stream.Send(&pb.DownloadResponse{
+						ChunkData: buf[:n],
+					}); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	if !find {
+		return status.Errorf(codes.NotFound, "file not found: %s", name.FileName)
+	}
 	return nil
 }
 
